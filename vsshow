@@ -1,0 +1,250 @@
+import sys,random
+from NaServer import *
+
+def get_volume_info(filer,user,pw,vol_name=''):
+    allVolsInfo=[]
+    #Title
+    allVolsInfo.append(
+        {
+            'CLUSTER_NAME': 'CLUSTER_NAME',
+            'SVM_NAME': 'SVM_NAME',
+            'VOL_NAME': 'VOL_NAME',
+            'NFS_EXPORT_PATH':'NFS_EXPORT_PATH',
+            'CIFS_SHARE_NAME':'CIFS_SHARE_NAME',
+            'VOL_SIZE': 'VOL_SIZE(GB)',
+            'VOL_USED': 'VOL_USED(GB)',
+            'VOL_STATUS': 'VOL_STATUS',
+            'AGGR_NAME': 'AGGR_NAME',
+            'NODE_NAME': 'NODE_NAME',
+            'POLICY_NAME':'POLICY_NAME',
+            'VAULT_DEST':'VAULT_DEST',
+            'MIRROR_DEST':'MIRROR_DEST'
+        }
+    )
+    s = NaServer(filer, 1, 15)
+
+    response = s.set_style('LOGIN')
+    if (response and response.results_errno() != 0):
+        r = response.results_reason()
+        print("Unable to set authentication style " + r + "\n")
+        return 2
+
+    s.set_admin_user(user, pw)
+    response = s.set_transport_type('HTTPS')
+
+    if (response and response.results_errno() != 0):
+        r = response.results_reason()
+        print("Unable to set HTTP transport " + r + "\n")
+        return 2
+    #system-get-info
+    out = s.invoke("system-get-version")
+    if (out.results_status() == "failed"):
+        print(out.results_reason() + "\n")
+        return 2
+
+    version=out.child_get_string('version')
+    isCDOT = out.child_get_string('is-clustered')
+    print(version)
+    print(isCDOT)
+
+    #system_info = out.child_get("system-info")
+    #system_name=system_info.child_get_string('version')
+    #volume-list-info
+
+
+
+
+
+    api = NaElement("vserver-get-iter")
+
+    xi = NaElement("desired-attributes")
+    api.child_add(xi)
+
+    xi1 = NaElement("vserver-info")
+    xi.child_add(xi1)
+
+    xi1.child_add_string("operational-state", "<operational-state>")
+    xi1.child_add_string("root-volume", "<root-volume>")
+    xi1.child_add_string("root-volume-aggregate", "<root-volume-aggregate>")
+    xi1.child_add_string("state", "<state>")
+    xi1.child_add_string("vserver-name", "<vserver-name>")
+    xi1.child_add_string("vserver-subtype", "<vserver-subtype>")
+    xi1.child_add_string("vserver-type", "<vserver-type>")
+    api.child_add_string("max-records", "99999")
+
+    xo = s.invoke_elem(api)
+    if (xo.results_status() == "failed"):
+        print("Error:\n")
+        print(xo.sprintf())
+        sys.exit(1)
+    xo = s.invoke_elem(api)
+    if (xo.results_status() == "failed") :
+        print ("Error:\n")
+        print (xo.sprintf())
+        sys.exit (1)
+    #print(xo.sprintf())
+    #rec = xo.child_get_string('num-records')
+    #print(rec)
+    print(xo.child_get_string("num-records"))
+    out=xo.child_get('attributes-list').children_get()
+    print('vs_name,vs_type,vs_subtype,vs_adminstate,vs_opstate,vs_rootvol,vs_aggr')
+    for vs in out:
+        vs_name = vs.child_get_string("vserver-name")
+        vs_type = vs.child_get_string('vserver-type')
+        vs_subtype = vs.child_get_string('vserver-subtype')
+        if not vs_subtype:
+            vs_subtype='-'
+        vs_adminstate = vs.child_get_string('state')
+        if not vs_adminstate:
+            vs_adminstate='-'
+        vs_opstate = vs.child_get_string('perational-state')
+        if not vs_opstate:
+            vs_opstate='-'
+        vs_rootvol = vs.child_get_string('root-volume')
+        if not vs_rootvol:
+            vs_rootvol='-'
+        vs_aggr = vs.child_get_string('root-volume-aggregate')
+        if not vs_aggr:
+            vs_aggr='-'
+        if vs_name != 'Cluster':
+            print(vs_name,vs_type,vs_subtype,vs_adminstate,vs_opstate,vs_rootvol,vs_aggr,sep=',')
+
+    myvol='zpw'+vol_name
+    myvs='SVM1'
+    print('\nCreating %s on VServer %s' % (myvol,myvs))
+    s.set_vserver(myvs)
+
+    api = NaElement("volume-create")
+    api.child_add_string("containing-aggr-name", "aggr1_Cluster01_01")
+    api.child_add_string("size", str(random.randint(1,1000)*1024*1024))
+    api.child_add_string("volume", myvol)
+
+    xo = s.invoke_elem(api)
+    if (xo.results_status() == "failed"):
+        print("Error:\n")
+        print(xo.sprintf())
+        sys.exit(1)
+
+    print("Received:",end='')
+    print(xo.sprintf())
+
+    s.set_vserver("SVM1")
+    api = NaElement("volume-get-iter")
+    xi = NaElement("desired-attributes")
+    api.child_add(xi)
+    xi1 = NaElement("volume-attributes")
+    xi.child_add(xi1)
+
+
+    xi2 = NaElement("volume-id-attributes")
+    xi1.child_add(xi2)
+
+    xi2.child_add_string("containing-aggregate-name","<containing-aggregate-name>")
+    xi2.child_add_string("name","<name>")
+    xi2.child_add_string("owning-vserver-name","<owning-vserver-name>")
+    xi2.child_add_string("type","<type>")
+
+    xi3 = NaElement("volume-space-attributes")
+    xi1.child_add(xi3)
+
+    xi3.child_add_string("filesystem-size","<filesystem-size>")
+    xi3.child_add_string("percentage-size-used","<percentage-size-used>")
+    xi3.child_add_string("size-available","<size-available>")
+
+    xi4 = NaElement("volume-state-attributes")
+    xi1.child_add(xi4)
+
+    xi4.child_add_string("state","<state>")
+    api.child_add_string("max-records","3")
+
+
+    xo = s.invoke_elem(api)
+    if (xo.results_status() == "failed") :
+        print ("Error:\n")
+        print (xo.sprintf())
+        sys.exit (1)
+
+    print ("Received:\n")
+    print (xo.sprintf())
+    nexttag=xo.child_get_string('next-tag')
+    for out in xo.child_get('attributes-list').children_get():
+        out1=out.child_get('volume-id-attributes')
+        vs_name=out1.child_get_string('owning-vserver-name')
+        vol_name=out1.child_get_string('name')
+        aggr=out1.child_get_string('containing-aggregate-name')
+        vol_type=out1.child_get_string('type')
+        out2=out.child_get('volume-space-attributes')
+        size='%.2f' % (int(out2.child_get_string('filesystem-size'))/1024/1024)
+        used = out2.child_get_string('percentage-size-used')+'%'
+        asize ='%.2f' %( int(out2.child_get_string('size-available'))/1024/1024)
+        out3=out.child_get('volume-state-attributes')
+        state=out3.child_get_string('state')
+        print(vs_name,vol_name,aggr,state,vol_type,size,asize,used,sep=',')
+    #iteration
+    print('next query')
+    api = NaElement("volume-get-iter")
+    api.child_add_string('tag',nexttag)
+    xi = NaElement("desired-attributes")
+    api.child_add(xi)
+    xi1 = NaElement("volume-attributes")
+    xi.child_add(xi1)
+
+
+    xi2 = NaElement("volume-id-attributes")
+    xi1.child_add(xi2)
+
+    xi2.child_add_string("containing-aggregate-name","<containing-aggregate-name>")
+    xi2.child_add_string("name","<name>")
+    xi2.child_add_string("owning-vserver-name","<owning-vserver-name>")
+    xi2.child_add_string("type","<type>")
+
+    xi3 = NaElement("volume-space-attributes")
+    xi1.child_add(xi3)
+
+    xi3.child_add_string("filesystem-size","<filesystem-size>")
+    xi3.child_add_string("percentage-size-used","<percentage-size-used>")
+    xi3.child_add_string("size-available","<size-available>")
+
+    xi4 = NaElement("volume-state-attributes")
+    xi1.child_add(xi4)
+
+    xi4.child_add_string("state","<state>")
+    api.child_add_string("max-records","100")
+
+
+    xo = s.invoke_elem(api)
+    if (xo.results_status() == "failed") :
+        print ("Error:\n")
+        print (xo.sprintf())
+        sys.exit (1)
+
+    print ("Received:\n")
+    print (xo.sprintf())
+
+    for out in xo.child_get('attributes-list').children_get():
+        out1=out.child_get('volume-id-attributes')
+        vs_name=out1.child_get_string('owning-vserver-name')
+        vol_name=out1.child_get_string('name')
+        aggr=out1.child_get_string('containing-aggregate-name')
+        vol_type=out1.child_get_string('type')
+        out2=out.child_get('volume-space-attributes')
+        size='%.2f' % (int(out2.child_get_string('filesystem-size'))/1024/1024)
+        used = out2.child_get_string('percentage-size-used')+'%'
+        asize ='%.2f' %( int(out2.child_get_string('size-available'))/1024/1024)
+        out3=out.child_get('volume-state-attributes')
+        state=out3.child_get_string('state')
+        print(vs_name,vol_name,aggr,state,vol_type,size,asize,used,sep=',')
+
+
+
+
+if __name__ == '__main__':
+    args = len(sys.argv) - 1
+    if (args < 3):
+        print('Usage: getVol '+ 'filer '+ 'user '+ 'password' + 'volname')
+        sys.exit(1)
+        # print_usage()
+    filer = sys.argv[1]
+    user = sys.argv[2]
+    pw = sys.argv[3]
+    get_volume_info(filer,user,pw,vol_name=sys.argv[4])
