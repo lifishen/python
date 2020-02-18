@@ -1,0 +1,463 @@
+import sys,time
+import threading
+import pymysql.cursors
+from NaServer import *
+def run_threaded(*args):
+    job_thread = threading.Thread(target=get_volume_info,args=args)
+    job_thread.start()
+def get_volume_info(filer,user,pw):
+    global csvfile
+    allVolsInfo=[]
+    print('Filer: ',user+'@'+filer)
+    s = NaServer(filer, 1, 3)
+    response = s.set_style('LOGIN')
+    if (response and response.results_errno() != 0):
+        r = response.results_reason()
+        print("Unable to set authentication style " + r + "\n")
+        return 2
+
+    s.set_admin_user(user, pw)
+    response = s.set_transport_type('HTTP')
+
+    if (response and response.results_errno() != 0):
+        r = response.results_reason()
+        print("Unable to set HTTP transport " + r + "\n")
+        return 2
+    #system-get-info
+    #print('NaServer', 'before-system-get-info')
+    out = s.invoke("system-get-info")
+    #print('NaServer', 'after-invoke-system-get-info')
+    if (out.results_status() == "failed"):
+        print(out.results_reason() + "\n")
+        return 2
+    #print('child-get-system-info')
+    system_info = out.child_get("system-info")
+    system_name=system_info.child_get_string('system-name')
+    system_id=system_info.child_get_string('system-id')
+    #volume-list-info
+    out = s.invoke("volume-list-info")
+    if (out.results_status() == "failed"):
+        print(out.results_reason() + "\n")
+        return 2
+    volume_info = out.child_get("volumes")
+    result = volume_info.children_get()
+    for vol in result:
+        vol_name = vol.child_get_string("name")
+        #<owning-vfiler>vfiler0</owning-vfiler>
+        owning_vfiler=vol.child_get_string("owning-vfiler")
+        # if owning_vfiler none, set vfiler0
+        if not owning_vfiler:
+            owning_vfiler='vfiler0'
+        #filesystem_size = vol.child_get_int("filesystem-size")/1024/1024/1024
+        size_total = '%.2f' % float(vol.child_get_int("size-total")/1024/1024/1024)
+        size_used  = '%.2f' % float(vol.child_get_int("size-used" )/1024/1024/1024)
+        status = vol.child_get_string("state")
+        aggr = vol.child_get_string("containing-aggregate")
+        allVolsInfo.append(
+            {
+                'CLUSTER_NAME':system_name,
+                'SVM_NAME':owning_vfiler,
+                'VOL_NAME':vol_name,
+                'VOL_SIZE':size_total,
+                'VOL_USED':size_used,
+                'VOL_STATUS':status,
+                'AGGR_NAME':aggr,
+                'NODE_NAME':system_name,
+                #initialize 8 columns
+            }
+        )
+    #check nfs rules
+    out = s.invoke("nfs-exportfs-list-rules")
+    export_info = out.child_get("rules")
+    if (export_info):
+        result = export_info.children_get()
+        vol_export_path={}
+        #init vol_export_path dict
+        for export in result:
+            path_name = export.child_get_string("pathname")
+            actual_pathname = export.child_get_string("actual-pathname")
+            if not actual_pathname:
+                actual_pathname=path_name
+            #print(path_name,actual_pathname)
+            #print(actual_pathname.split('/')[2])
+            #get vol name which has export
+            vol_export_path[actual_pathname.split('/')[2]]=[]
+        # fill up dict
+        for export in result:
+            path_name = export.child_get_string("pathname")
+            actual_pathname = export.child_get_string("actual-pathname")
+            if not actual_pathname:
+                actual_pathname=path_name
+            #print(path_name,actual_pathname)
+            vol_export_path[actual_pathname.split('/')[2]].append(path_name)
+        #print(vol_export_path)
+        for volInfo in allVolsInfo:
+            if volInfo['VOL_NAME'] in vol_export_path.keys():
+                volInfo['NFS_EXPORT_PATH']=vol_export_path[volInfo['VOL_NAME']]
+                paths=''
+                for path in volInfo['NFS_EXPORT_PATH']:
+                    paths=paths+path+';'
+                volInfo['NFS_EXPORT_PATH'] = paths[:-1]
+            else:
+                #not exported
+                volInfo['NFS_EXPORT_PATH']='0'
+    else:
+        #no exports
+        for volInfo in allVolsInfo:
+                volInfo['NFS_EXPORT_PATH']='0'
+
+    #check cifs
+
+    out = s.invoke("cifs-share-list-iter-start")
+
+    if(out.results_status() == "failed"):
+        print(str(out.results_reason()) + "\n")
+        #return 2
+        #omit, CIFS not running.  Use " cifs restart" to restart
+        for volInfo in allVolsInfo:
+            volInfo['CIFS_SHARE_NAME']='0'
+    else:
+        records = out.child_get_string("records")
+        tag = out.child_get_string("tag")
+        i = 0
+        vol_cifs_share = {}
+        while(i < int(records)):
+            rec = s.invoke("cifs-share-list-iter-next", "maximum", 1, "tag", tag)
+            if(rec.results_status() == "failed"):
+                print(rec.results_reason() + "\n")
+            else:
+                statList = rec.child_get("cifs-shares")
+                if (statList != None):
+                    result = statList.children_get()
+                for stat in result:
+                    #print(stat.child_get_string("share-name"),stat.child_get_string("mount-point"))
+                    vol_cifs_share[stat.child_get_string("share-name")]=stat.child_get_string("mount-point")
+                i = i + 1
+        end = s.invoke("cifs-share-list-iter-end","tag", tag)
+        #print(vol_cifs_share)
+        for volInfo in allVolsInfo:
+            volInfo['CIFS_SHARE_NAME']=''
+            for sharekey in vol_cifs_share:
+                #print(vol_cifs_share[sharekey])
+                try:
+                    sharevol=vol_cifs_share[sharekey].split('/')[2]
+                except Exception as e:
+                    sharevol=''
+                if volInfo['VOL_NAME'] == sharevol:
+                    volInfo['CIFS_SHARE_NAME']=volInfo['CIFS_SHARE_NAME'] + sharekey + ';'
+            if volInfo['CIFS_SHARE_NAME']=='':
+                volInfo['CIFS_SHARE_NAME'] = '0'
+            else:
+                volInfo['CIFS_SHARE_NAME'] = volInfo['CIFS_SHARE_NAME'][:-1]
+
+    #policy
+    for volInfo in allVolsInfo:
+        volInfo['POLICY_NAME']='0'
+
+
+    #check snapvault
+    out = s.invoke("snapvault-primary-relationship-status-list-iter-start")
+    sv_relationships=[]
+    if(out.results_status() == "failed"):
+        print(str(out.results_reason()) + "\n")
+        for volInfo in allVolsInfo:
+            volInfo['VAULT_DEST']='0'
+    else:
+        records = out.child_get_string("records")
+        tag = out.child_get_string("tag")
+        i = 0
+        while(i < int(records)):
+            rec = s.invoke("snapvault-primary-relationship-status-list-iter-next", "maximum", 1, "tag", tag)
+            if(rec.results_status() == "failed"):
+                print(rec.results_reason() + "\n")
+            else:
+                statList = rec.child_get("status-list")
+                if (statList != None):
+                    result = statList.children_get()
+                    for stat in result:
+                        srcfiler=stat.child_get_string("source-system")
+                        srcpath =stat.child_get_string("source-path")
+                        dstfiler=stat.child_get_string("destination-system")
+                        dstpath =stat.child_get_string("destination-path")
+                        sv_relationships.append([srcfiler,srcpath,dstfiler + ':' + dstpath])
+                        #print(srcfiler+":"+srcpath+'  '+dstfiler+":"+dstpath)
+            i = i + 1
+        #print(sv_relationships)
+        end = s.invoke("snapvault-primary-relationship-status-list-iter-end","tag", tag)
+        for volInfo in allVolsInfo:
+            volInfo['VAULT_DEST']=''
+            for sv_relationship in sv_relationships:
+                if sv_relationship[0]==system_name:
+                    if sv_relationship[1].split('/')[2]==volInfo['VOL_NAME']:
+                        #match snapvault
+                        volInfo['VAULT_DEST'] = volInfo['VAULT_DEST'] + sv_relationship[2] + ';'
+            if volInfo['VAULT_DEST'] == '':
+                volInfo['VAULT_DEST'] = '0'
+            else:
+                volInfo['VAULT_DEST']=volInfo['VAULT_DEST'][:-1]
+
+
+    #snapmirror
+    out = s.invoke("snapmirror-get-status")
+    sm_relationships = []
+    if(out.results_status() == "failed"):
+        print(out.results_reason() + "\n")
+        for volInfo in allVolsInfo:
+            volInfo['MIRROR_DEST'] = '0'
+    else:
+        status = out.child_get("snapmirror-status")
+        if(not(status == None)):
+            result = status.children_get()
+            for snapStat in result:
+                sm_src = snapStat.child_get_string("source-location")
+                sm_dst=snapStat.child_get_string("destination-location")
+                #print('sm_src '+ sm_src)
+                try:
+                    sm_relationships.append([sm_src.split(':')[0],sm_src.split(':')[1],sm_dst])
+                    #volume snapmirror  src:vol
+                    #qtree snapmirror   src:/vol/vol_name/- or qtree
+                except Exception as e:
+                    print(sm_src)
+                    print(e)
+            #print(sm_relationships)
+        for volInfo in allVolsInfo:
+            volInfo['MIRROR_DEST'] = ''
+            for sm_relationship in sm_relationships:
+                if sm_relationship[0] == system_name:
+                    # volume snapmirror or qtree snapmirror ?
+                    smSrcVol=''
+                    try:
+                        tmp=sm_relationship[1].index('/')
+                        #success, qtree snapmirror
+                        smSrcVol=sm_relationship[1].split('/')[2]
+                    except:
+                        #volume snapmirror
+                        smSrcVol=sm_relationship[1]
+                    if smSrcVol == volInfo['VOL_NAME']:
+                        # match snapmirror
+                        volInfo['MIRROR_DEST'] = volInfo['MIRROR_DEST'] + sm_relationship[2] + ';'
+            if volInfo['MIRROR_DEST'] == '':
+                volInfo['MIRROR_DEST'] = '0'
+            else:
+                volInfo['MIRROR_DEST'] = volInfo['MIRROR_DEST'][:-1]
+    #final print
+    #print(allVolsInfo)
+    '''for volInfo in allVolsInfo:
+        print(volInfo['CLUSTER_NAME'], volInfo['SVM_NAME'], volInfo['VOL_NAME'], volInfo['NFS_EXPORT_PATH'],
+              volInfo['CIFS_SHARE_NAME'], volInfo['VOL_SIZE'], volInfo['VOL_USED'], volInfo['VOL_STATUS'],
+              volInfo['AGGR_NAME'], volInfo['NODE_NAME'], volInfo['POLICY_NAME'], volInfo['VAULT_DEST'],
+              volInfo['MIRROR_DEST'], sep=',')'''
+    fileLock.acquire()
+    for volInfo in allVolsInfo:
+        with open(csvfile,'a+') as myfile:
+            print(volInfo['CLUSTER_NAME'], volInfo['SVM_NAME'], volInfo['VOL_NAME'], volInfo['NFS_EXPORT_PATH'],
+              volInfo['CIFS_SHARE_NAME'], volInfo['VOL_SIZE'], volInfo['VOL_USED'], volInfo['VOL_STATUS'],
+              volInfo['AGGR_NAME'], volInfo['NODE_NAME'], volInfo['POLICY_NAME'], volInfo['VAULT_DEST'],
+              volInfo['MIRROR_DEST'], sep=',',file=myfile)
+    fileLock.release()
+    global toMySql
+    toMySql=False
+    if toMySql:
+        global dbhost,dbport,dbuser,dbpassword,dbname,table_name
+        try:
+            connection = pymysql.connect(
+                host=dbhost,
+                port=dbport,
+                user=dbuser,
+                password=dbpassword,
+                db=dbname,
+                cursorclass=pymysql.cursors.DictCursor
+            )
+            with connection.cursor() as cursor:
+                sql = 'INSERT INTO' + '`' + table_name + '`' + ''' (
+                      `CLUSTER_NAME`,
+                      `SVM_NAME`,
+                      `VOL_NAME`,
+                      `NFS_EXPORT_PATH`,
+                      `CIFS_SHARE_NAME`,
+                      `VOL_SIZE(GB)`,
+                      `VOL_USED(GB)`,
+                      `VOL_STATUS`,
+                      `AGGR_NAME`,
+                      `NODE_NAME`,
+                      `POLICY_NAME`,
+                      `VAULT_DEST`,
+                      `MIRROR_DEST`
+                      ) 
+                    VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s) '''
+
+                for volInfo in allVolsInfo:
+                    info=(volInfo['CLUSTER_NAME'],
+                          volInfo['SVM_NAME'],
+                          volInfo['VOL_NAME'],
+                          volInfo['NFS_EXPORT_PATH'],
+                          volInfo['CIFS_SHARE_NAME'],
+                          volInfo['VOL_SIZE'],
+                          volInfo['VOL_USED'],
+                          volInfo['VOL_STATUS'],
+                          volInfo['AGGR_NAME'],
+                          volInfo['NODE_NAME'],
+                          volInfo['POLICY_NAME'][:255],
+                          volInfo['VAULT_DEST'][:255],
+                          volInfo['MIRROR_DEST'][:255])
+                    cursor.execute(sql, info)
+                try:
+                    connection.commit()
+                except Exception as e:
+                    connection.rollback()
+        except Exception as e:
+            print(e)
+        finally:
+            try:
+                connection.close()
+            except Exception as e:
+                print(e)
+
+
+
+def print_usage():
+    print('To save as a csv file only:')
+    print(' Usage: getVol ' + 'getVol.cfg')
+    print('To save as a csv file and upload to MySql:')
+    print(' Usage: getVol ' + 'getVol.cfg' + ' host port user password database table')
+    print('''\
+            getVol.cfg example:
+                192.168.230.11 root root1234
+                192.168.230.12 root root1234
+            save file only example:
+                getVol getVol.cfg 
+            save file and upload to MySql example:
+                getVol getVol.cfg 192.168.230.143 3306 root Root1234 dbnetappoper 7dot_vol_info 
+         ''')
+
+if __name__ == '__main__':
+    print('Author: Peiwei Zhang'.center(80))
+    print('Contact: peiwei@netapp.com'.center(80))
+    print(('NetApp Professional Service 7-Mode getVol Information Tool V3.0 For CPIC').center(80))
+    timenow=time.strftime("%Y%m%d%H%M%S", time.localtime())
+    csvfile='getVol_'+timenow+'.csv'
+    toMySql=False
+    argNum = len(sys.argv) - 1
+    if (argNum < 1):
+        print_usage()
+        sys.exit(1)
+    elif argNum==1:
+        print('Info: Output will save to ' + csvfile + ' Only.')
+    elif argNum==7:
+        print('Info: Output will save to ' + csvfile + ' and '+sys.argv[6]+'.'+sys.argv[7])
+        toMySql=True
+    else:
+        print('Error: Need 1 or 7 parameters,'+'but '+str(argNum) +' provided.')
+        print_usage()
+        sys.exit(1)
+    jobFilers=[]
+    try:
+        cfgFile = open(sys.argv[1])
+        for line in cfgFile:
+            myline=tuple(line.split())
+            if myline:
+                jobFilers.append(myline)
+        cfgFile.close
+    except Exception as e:
+        print(e)
+        sys.exit(1)
+    #Title
+    title={
+            'CLUSTER_NAME': 'CLUSTER_NAME',
+            'SVM_NAME': 'SVM_NAME',
+            'VOL_NAME': 'VOL_NAME',
+            'NFS_EXPORT_PATH':'NFS_EXPORT_PATH',
+            'CIFS_SHARE_NAME':'CIFS_SHARE_NAME',
+            'VOL_SIZE': 'VOL_SIZE(GB)',
+            'VOL_USED': 'VOL_USED(GB)',
+            'VOL_STATUS': 'VOL_STATUS',
+            'AGGR_NAME': 'AGGR_NAME',
+            'NODE_NAME': 'NODE_NAME',
+            'POLICY_NAME':'POLICY_NAME',
+            'VAULT_DEST':'VAULT_DEST',
+            'MIRROR_DEST':'MIRROR_DEST'
+        }
+
+    '''print(title['CLUSTER_NAME'], title['SVM_NAME'], title['VOL_NAME'], title['NFS_EXPORT_PATH'],
+          title['CIFS_SHARE_NAME'], title['VOL_SIZE'], title['VOL_USED'], title['VOL_STATUS'],
+          title['AGGR_NAME'], title['NODE_NAME'], title['POLICY_NAME'], title['VAULT_DEST'],
+          title['MIRROR_DEST'], sep=',')'''
+    myfile=open(csvfile,'w')
+    print(title['CLUSTER_NAME'], title['SVM_NAME'], title['VOL_NAME'], title['NFS_EXPORT_PATH'],
+              title['CIFS_SHARE_NAME'], title['VOL_SIZE'], title['VOL_USED'], title['VOL_STATUS'],
+              title['AGGR_NAME'], title['NODE_NAME'], title['POLICY_NAME'], title['VAULT_DEST'],
+              title['MIRROR_DEST'], sep=',',file=myfile)
+    myfile.flush()
+    myfile.close()
+    toMySql=False
+    if toMySql:
+        dbhost = sys.argv[2]
+        dbport = int(sys.argv[3])
+        dbuser = sys.argv[4]
+        dbpassword = sys.argv[5]
+        dbname = sys.argv[6]
+        table_name=sys.argv[7]
+        try:
+            connection = pymysql.connect(
+                host=dbhost,
+                port=dbport,
+                user=dbuser,
+                password=dbpassword,
+                db=dbname,
+                cursorclass=pymysql.cursors.DictCursor
+            )
+            with connection.cursor() as cursor:
+                sql = 'CREATE TABLE ' + '`' + table_name + '_' + timenow + '`' + ' as SELECT * from ' + '`' + table_name + '`'
+                cursor.execute(sql)
+                print('SUCCESS: Backup table ' + table_name + ' as ' + table_name + '.' + timenow)
+                sql='DROP TABLE '+ '`' + table_name + '`'
+                cursor.execute(sql)
+                sql='CREATE TABLE '+'`'+table_name+'`' + ''' (
+  `CLUSTER_NAME` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `SVM_NAME` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `VOL_NAME` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `NFS_EXPORT_PATH` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `CIFS_SHARE_NAME` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `VOL_SIZE(GB)` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `VOL_USED(GB)` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `VOL_STATUS` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `AGGR_NAME` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `NODE_NAME` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `POLICY_NAME` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `VAULT_DEST` varchar(255) COLLATE utf8_bin DEFAULT NULL,
+  `MIRROR_DEST` varchar(255) COLLATE utf8_bin DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin;
+                              
+                '''
+                cursor.execute(sql)
+                connection.commit()
+        except Exception as e:
+            print(e)
+            sys.exit(2)
+        finally:
+            try:
+                connection.close()
+            except:
+                pass
+
+    fileLock=threading.Semaphore()
+    for jobFiler in jobFilers:
+        #run_threaded(*jobFiler)
+        get_volume_info(*jobFiler)
+'''    if not toMySql:
+        print('Output saved to file: '+csvfile)
+    else:
+        print('Output saved to file: ' + csvfile + ' and '+sys.argv[6]+'.'+sys.argv[7])'''
